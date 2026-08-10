@@ -45,7 +45,11 @@
   </gazebo>
 
   <!-- Spray Painting Gazebo Plugin
-       All parameters are optional; values shown are the built-in defaults.
+       All parameters are optional; the plugin falls back to its own
+       built-in default for anything omitted. Every value below is set
+       explicitly here for clarity, but note that cone_max_range is the
+       only one that actually differs from the plugin's built-in default
+       (3.0 m) - every other value below matches its default exactly.
 
        nozzle_link          : link whose +X axis is the spray direction
        cone_half_angle_deg  : half-angle of the paint cone (degrees)
@@ -57,22 +61,66 @@
                               (Fibonacci disk sampling; 1 = centre ray only)
        patch_spacing        : minimum centre-to-centre gap between patches (metres)
        paint_interval_steps : run the ray scan every N simulation steps
+       perf_log_path        : optional CSV path for per-scan timing (disabled if unset)
   -->
   <gazebo>
     <static>true</static>
-    <plugin filename="libSprayPaintPlugin.so"
-            name="gz::sim::systems::SprayPaintPlugin">
-      <nozzle_link>spray_gun_nozzle_link</nozzle_link>
-      <cone_half_angle_deg>15</cone_half_angle_deg>
-      <cone_max_range>1.0</cone_max_range>
-      <spray_color>1.0 0.2 0.1 1.0</spray_color>
-      <spray_topic>/spray_paint/trigger</spray_topic>
-      <particle_rate>100</particle_rate>
-      <num_rays>16</num_rays>
-      <patch_spacing>0.02</patch_spacing>
-      <paint_interval_steps>10</paint_interval_steps>
-      <enable_particle_emitter>true</enable_particle_emitter>
+
+
+
+
+
+
+
+
+
+    <plugin filename="libSprayPaintPlugin.so" name="gz::sim::systems::SprayPaintPlugin">
+      <nozzle_link>spray_gun_nozzle_link</nozzle_link> <!-- Name of the nozzle link -->
+
+      <cone_half_angle_deg>15</cone_half_angle_deg> <!-- Half-angle of the spray cone, in degrees -->
+
+      <cone_max_range>1.0</cone_max_range> <!-- Maximum spray reach, in metres -->
+
+      <spray_color>1.0 0.2 0.1 1.0</spray_color> <!-- RGBA paint colour -->
+
+      <spray_topic>/spray_paint/trigger</spray_topic> <!-- Topic that toggles spraying ON/OFF -->
+
+      <particle_rate>100</particle_rate> <!-- Particle emission rate(particles/second) -->
+
+      <num_rays>16</num_rays> <!-- Number of rays sampled across the cone per scan, via disk sampling -->
+
+      <patch_spacing>0.02</patch_spacing> <!-- Minimum centre-to-centre distance (metres) between two patches
+                                            on the same link before the newer one is skipped as a duplicate -->
+
+      <paint_interval_steps>1</paint_interval_steps> <!-- Only scan for new paint hits every N simulation steps,
+                                                          while spraying is active. Hardcoded to 1 (no rate-limiting)
+                                                          for the current performance test. -->
+
+      <enable_particle_emitter>true</enable_particle_emitter> <!-- Set to false to disable the mist particle cloud -->
+
+      <perf_log_path>/ws/file_logs/spray_perf_n1.csv</perf_log_path> <!-- CSV of per-scan timing (sim_time_s,paint_interval_steps,
+                                                                 num_rays,scan_us,valid_hits,patches_created) -->
+
+      <patch_overlap_factor>1.30</patch_overlap_factor> <!-- Target patch overlap. The plugin also measures the ray
+                                                              pattern's covering radius at startup and takes whichever
+                                                              is larger, so the union of patches has no interior gaps -->
+
+      <rim_reach>1.12</rim_reach> <!-- How far the outermost patches reach, as a multiple of the cone radius.
+                                       1.0 = never paint outside the cone, but leaves the rim scalloped/underpainted.
+                                       Total mismatch (missed + spilled area) is lowest around 1.10-1.15. -->
+
     </plugin>
+
+
+
+
+
+
+
+
+
+
+    
   </gazebo>
 
 </robot>

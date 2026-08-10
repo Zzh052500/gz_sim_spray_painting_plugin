@@ -39,7 +39,9 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def launch_setup(context, *args, **kwargs):
-    headless = LaunchConfiguration("headless")
+    headless             = LaunchConfiguration("headless")
+    paint_interval_steps = LaunchConfiguration("paint_interval_steps").perform(context)
+    perf_log_path        = LaunchConfiguration("perf_log_path").perform(context)
 
     # Plugin package: libSprayPaintPlugin.so
     spray_pkg_prefix = get_package_prefix("gz_sim_spray_painting_plugin")
@@ -60,6 +62,8 @@ def launch_setup(context, *args, **kwargs):
         "safety_limits:=true",
         "name:=ur",
         "tf_prefix:=",
+        f"paint_interval_steps:={paint_interval_steps}",
+        f"perf_log_path:={perf_log_path}",
     ]
     xacro_env = os.environ.copy()
     demo_pkg_prefix = "/ws/install/gz_spray_painting_plugin_demo"
@@ -310,6 +314,19 @@ def generate_launch_description():
             "headless",
             default_value="false",
             description="Run Gazebo server only (no GUI).",
+        ),
+        DeclareLaunchArgument(
+            "paint_interval_steps",
+            default_value="10",
+            description="Run the spray ray-scan every N simulation steps "
+                        "(1 = no rate-limiting, scan every tick).",
+        ),
+        DeclareLaunchArgument(
+            "perf_log_path",
+            default_value="/ws/file_logs/spray_perf_n10.csv",
+            description="CSV path for per-scan plugin timing "
+                        "(sim_time_s,paint_interval_steps,num_rays,scan_us,valid_hits,patches_created). "
+                        "Empty disables perf logging.",
         ),
         SetEnvironmentVariable(name="GZ_VERSION", value="harmonic"),
         OpaqueFunction(function=launch_setup),

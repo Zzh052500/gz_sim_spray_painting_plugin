@@ -39,8 +39,11 @@
   <xacro:arg name="particle_rate"            default="100"/>
   <xacro:arg name="num_rays"                 default="16"/>
   <xacro:arg name="patch_spacing"            default="0.02"/>
-  <xacro:arg name="paint_interval_steps"     default="10"/>
+  <xacro:arg name="paint_interval_steps"     default="1"/>
   <xacro:arg name="enable_particle_emitter"  default="true"/>
+  <xacro:arg name="perf_log_path"            default="/ws/file_logs/spray_perf_n1.csv"/>
+  <xacro:arg name="patch_overlap_factor"     default="1.30"/>
+  <xacro:arg name="rim_reach"                default="1.12"/>
 
   <!-- Standard UR arm kinematic description (no ros2_control tag yet) -->
   <xacro:include filename="$(find gz_spray_painting_plugin_demo)/urdf/ur_macro.xacro"/>
@@ -204,6 +207,9 @@
       <patch_spacing>$(arg patch_spacing)</patch_spacing>
       <paint_interval_steps>$(arg paint_interval_steps)</paint_interval_steps>
       <enable_particle_emitter>$(arg enable_particle_emitter)</enable_particle_emitter>
+      <perf_log_path>$(arg perf_log_path)</perf_log_path>
+      <patch_overlap_factor>$(arg patch_overlap_factor)</patch_overlap_factor>
+      <rim_reach>$(arg rim_reach)</rim_reach>
     </plugin>
   </gazebo>
 

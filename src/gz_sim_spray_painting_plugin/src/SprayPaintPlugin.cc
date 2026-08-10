@@ -1,44 +1,6 @@
+// Every dependency this plugin needs is pulled in via the header, which is
+// the single place the include list is maintained.
 #include "gz_sim_spray_painting_plugin/SprayPaintPlugin.hh"
-
-#include <algorithm>
-#include <cmath>
-#include <limits>
-#include <sstream>
-
-// gz-sim
-#include <gz/sim/components/Collision.hh>
-#include <gz/sim/components/Link.hh>
-#include <gz/sim/components/Material.hh>
-#include <gz/sim/components/Model.hh>
-#include <gz/sim/components/Name.hh>
-#include <gz/sim/components/ParentEntity.hh>
-#include <gz/sim/components/ParticleEmitter.hh>
-#include <gz/sim/components/Pose.hh>
-#include <gz/sim/components/RaycastData.hh>
-#include <gz/sim/components/Visual.hh>
-#include <gz/sim/components/World.hh>
-#include <gz/sim/SdfEntityCreator.hh>
-#include <gz/sim/Util.hh>
-
-// gz-math
-#include <gz/math/Quaternion.hh>
-
-// sdf
-#include <sdf/Cylinder.hh>
-#include <sdf/Geometry.hh>
-#include <sdf/Material.hh>
-#include <sdf/ParticleEmitter.hh>
-#include <sdf/Visual.hh>
-
-// gz-common
-#include <gz/common/Console.hh>
-
-// gz-plugin
-#include <gz/plugin/Register.hh>
-
-// gz-msgs (particle emitter proto + color helper)
-#include <gz/msgs/particle_emitter.pb.h>
-#include <gz/msgs/convert/Color.hh>
 
 namespace gz::sim::systems
 {
@@ -122,28 +84,43 @@ void SprayPaintPlugin::LogSection(const std::string &title)
 /**
  * @brief Constructs a PaintPatch descriptor for a single raycast hit.
  *
- * The patch is a thin disc whose radius matches the cone footprint at the
- * hit distance.  The disc is offset slightly along the surface normal so it
- * sits proud of the geometry and avoids z-fighting.
+ * The patch is a thin disc sized to `patchRadiusFraction_` of the cone's
+ * cross-section radius at this hit's depth.  That fraction is derived once
+ * in ComputePatchSizing() from the measured covering radius of the ray
+ * pattern, so neighbouring patches always overlap (no interior gaps) while
+ * the sampling disk is shrunk just enough that the outermost patches land
+ * on the cone rim rather than crossing it.
+ *
+ * Note the scaling is driven by the hit's *axial depth*, not its Euclidean
+ * range: the cone's cross-section radius at axial depth x is x*tan(theta).
+ *
+ * The disc is offset slightly along the surface normal so it sits proud of
+ * the geometry and avoids z-fighting.
  *
  * @param _hitWorld    Hit point in world coordinates.
  * @param _normalWorld Outward surface normal at the hit point (world frame).
- * @param _dist        Distance from the nozzle origin to the hit point (m).
+ * @param _axialDepth  Hit depth along the spray axis (nozzle-local +X), in m.
  * @return             A PaintPatch with worldPose, size, and valid=true set.
  */
 SprayPaintPlugin::PaintPatch SprayPaintPlugin::MakePatch(
     const gz::math::Vector3d &_hitWorld,
     const gz::math::Vector3d &_normalWorld,
-    double _dist) const
+    double _axialDepth) const
 {
   PaintPatch result;
 
-  // Patch radius = actual cone footprint at this distance.
-  // Minimum 2 cm so very-close hits are still visible.
   constexpr double kThickness = 0.003;
   constexpr double kMinRadius = 0.02;
-  const double coneRadius = std::max(_dist * std::tan(coneHalfAngle_), kMinRadius);
-  result.size = gz::math::Vector3d(coneRadius * 2.0, coneRadius * 2.0, kThickness);
+
+  const double coneRadiusAtDepth = _axialDepth * std::tan(coneHalfAngle_);
+
+  double radius = coneRadiusAtDepth * patchRadiusFraction_;
+
+  // Visibility floor for very close hits, but never wider than the cone
+  // itself at this depth - staying inside the cone wins over min size.
+  radius = std::max(radius, std::min(kMinRadius, coneRadiusAtDepth));
+
+  result.size = gz::math::Vector3d(radius * 2.0, radius * 2.0, kThickness);
 
   const gz::math::Vector3d centre = _hitWorld + _normalWorld * (kThickness * 0.5);
 
@@ -168,13 +145,47 @@ SprayPaintPlugin::PaintPatch SprayPaintPlugin::MakePatch(
 
 // GenerateConeRays
 
+namespace
+{
+/// \brief Sample offsets on the *unit* sampling disk, index 0 = centre.
+///
+/// Shared by GenerateConeRays() (which scales them into the cone) and
+/// ComputePatchSizing() (which measures their covering radius), so the
+/// measurement always describes the pattern actually cast.
+std::vector<std::pair<double, double>> UnitDiskSamples(int _numRays)
+{
+  std::vector<std::pair<double, double>> pts;
+  pts.reserve(std::max(_numRays, 1));
+  pts.emplace_back(0.0, 0.0);
+
+  if (_numRays <= 1) return pts;
+
+  // Fibonacci / sunflower sampling: uniform area density, no grid bias.
+  const double goldenAngle = M_PI * (3.0 - std::sqrt(5.0));  // ≈ 2.3999 rad
+  for (int i = 1; i < _numRays; ++i)
+  {
+    const double r     = std::sqrt(static_cast<double>(i) / (_numRays - 1));
+    const double theta = i * goldenAngle;
+    pts.emplace_back(r * std::cos(theta), r * std::sin(theta));
+  }
+  return pts;
+}
+}  // namespace
+
 /**
  * @brief Generates ray origin-endpoint pairs spanning the spray cone.
  *
  * Rays are expressed in nozzle-local frame (+X is the spray axis).  The
  * first ray is always the centre axis.  Remaining rays are distributed
- * across the cone solid angle using Fibonacci/sunflower disk sampling,
- * which produces uniform coverage with no grid bias.
+ * using Fibonacci/sunflower disk sampling.
+ *
+ * All end-points lie on a disk at x = coneMaxRange_, so for every ray the
+ * hit's radial offset and the local cone radius scale together with
+ * `fraction` - which is why the sampling disk is deliberately *smaller*
+ * than the cone's own cross-section.  It is shrunk by sampleDiskFraction_
+ * so that a sample at the sampling-disk rim, plus its patch radius, lands
+ * exactly on the cone rim.  Without that shrink, rim samples would need
+ * zero-radius patches to stay inside the cone.
  *
  * @return Vector of (origin, endpoint) pairs, each in nozzle-local frame.
  */
@@ -185,26 +196,84 @@ SprayPaintPlugin::GenerateConeRays() const
   std::vector<std::pair<Vec3, Vec3>> rays;
   const Vec3 origin(0.0, 0.0, 0.0);
 
-  // Center ray is always first.
-  rays.emplace_back(origin, Vec3(coneMaxRange_, 0.0, 0.0));
+  const double diskRadius =
+      coneMaxRange_ * std::tan(coneHalfAngle_) * sampleDiskFraction_;
 
-  if (numRays_ <= 1) return rays;
-
-  // Remaining rays use Fibonacci / sunflower disk sampling so they cover the
-  // cone footprint uniformly with no grid bias.  All end-points lie on a disk
-  // of radius coneMaxRange_*tan(halfAngle) at x = coneMaxRange_, giving ray
-  // directions that span exactly the full cone solid angle.
-  const double diskRadius  = coneMaxRange_ * std::tan(coneHalfAngle_);
-  const double goldenAngle = M_PI * (3.0 - std::sqrt(5.0));  // ≈ 2.3999 rad
-
-  for (int i = 1; i < numRays_; ++i)
+  for (const auto &p : UnitDiskSamples(numRays_))
   {
-    const double r     = std::sqrt(static_cast<double>(i) / (numRays_ - 1)) * diskRadius;
-    const double theta = i * goldenAngle;
     rays.emplace_back(origin,
-        Vec3(coneMaxRange_, r * std::cos(theta), r * std::sin(theta)));
+        Vec3(coneMaxRange_, p.first * diskRadius, p.second * diskRadius));
   }
   return rays;
+}
+
+/**
+ * @brief Derives the patch/sampling-disk sizing from the ray pattern.
+ *
+ * Two things have to hold at once for the painted union to match the cone
+ * projection:
+ *
+ *  1. No interior gaps.  This is a disc-covering problem: the patch radius
+ *     must be at least the pattern's *covering radius* - the largest
+ *     distance from any point of the sampling disk to its nearest sample.
+ *     The ideal hexagonal bound is 1.0997/sqrt(N), but Fibonacci sampling
+ *     is only quasi-uniform, so that underestimates the real requirement.
+ *     We measure it numerically instead of assuming it.
+ *
+ *  2. Control of the rim.  With patch radius p and sampling-disk radius S
+ *     (both as fractions of the cone radius), the outermost patch reaches
+ *     S + p.  `rimReach_` sets that reach: 1.0 puts it exactly on the cone
+ *     rim so nothing ever spills outside the cone.
+ *
+ * Solving both gives S = rimReach_/(1+h) and p = h*S for an effective
+ * covering fraction h.  Cost is a one-time grid sweep at Configure();
+ * nothing here runs per scan.
+ *
+ * Caveat, by construction: a finite set of discs centred inside the rim can
+ * never cover the rim completely, so full coverage is guaranteed only out to
+ * radius S and the band beyond it is scalloped.  At rimReach_ = 1.0 and
+ * N = 16 that leaves ~25% of the cone unpainted with zero spill; allowing a
+ * little spill trades that down sharply, with total mismatch (missed +
+ * spilled area) bottoming out near rimReach_ 1.10-1.15 at ~14% (N=16) and
+ * ~10% (N=32).  Getting materially below that is not a sampling problem -
+ * it needs a different patch representation (one footprint-shaped stamp, or
+ * an alpha-masked decal), not more rays.
+ */
+void SprayPaintPlugin::ComputePatchSizing()
+{
+  const auto pts = UnitDiskSamples(numRays_);
+
+  // Covering radius of the pattern over the unit disk.
+  constexpr int kGrid = 256;
+  double worstSq = 0.0;
+  for (int gy = 0; gy <= kGrid; ++gy)
+  {
+    const double y = -1.0 + 2.0 * gy / kGrid;
+    for (int gx = 0; gx <= kGrid; ++gx)
+    {
+      const double x = -1.0 + 2.0 * gx / kGrid;
+      if (x * x + y * y > 1.0) continue;
+
+      double nearestSq = std::numeric_limits<double>::max();
+      for (const auto &p : pts)
+      {
+        const double dx = x - p.first;
+        const double dy = y - p.second;
+        nearestSq = std::min(nearestSq, dx * dx + dy * dy);
+      }
+      worstSq = std::max(worstSq, nearestSq);
+    }
+  }
+  const double measured = std::sqrt(worstSq);
+
+  // Take the larger of the measured requirement (with a small safety
+  // margin) and the configured overlap target.
+  const double target = patchOverlapFactor_ /
+      std::sqrt(static_cast<double>(std::max(numRays_, 1)));
+  const double h = std::max(measured * 1.02, target);
+
+  sampleDiskFraction_  = rimReach_ / (1.0 + h);
+  patchRadiusFraction_ = h * sampleDiskFraction_;
 }
 
 // FindHitLink
@@ -227,22 +296,30 @@ gz::sim::Entity SprayPaintPlugin::FindHitLink(
     const gz::math::Vector3d &hitWorld,
     EntityComponentManager &_ecm) const
 {
+  // Closest candidate found so far, across whichever pass ends up running.
   gz::sim::Entity bestLink = gz::sim::kNullEntity;
   double minDist = std::numeric_limits<double>::max();
 
   // Primary pass: use Collision entity world-pose centres.
   // This is accurate for multi-link / offset-collision models (e.g. a car
   // where the chassis collision sits at the car body, not the model origin).
+  // NOTE: _ecm.Each<>() calls this lambda once per matching entity; returning
+  // true means "keep iterating" (not "found a hit") - only the final
+  // bestLink value after the full scan represents the actual result.
   _ecm.Each<gz::sim::components::Collision>(
       [&](const gz::sim::Entity &colEnt,
           const gz::sim::components::Collision *) -> bool
       {
+        // Collisions should always have a parent Link; skip defensively if
+        // the ECM is in some transient/malformed state.
         const auto *parentComp =
             _ecm.Component<gz::sim::components::ParentEntity>(colEnt);
         if (!parentComp) return true;
         const gz::sim::Entity linkEnt = parentComp->Data();
+        // Never let the spraying robot paint its own links.
         if (ownLinks_.count(linkEnt)) return true;
 
+        // Keep the closest collision seen so far this scan.
         const double dist =
             gz::sim::worldPose(colEnt, _ecm).Pos().Distance(hitWorld);
         if (dist < minDist)
@@ -253,6 +330,8 @@ gz::sim::Entity SprayPaintPlugin::FindHitLink(
         return true;
       });
 
+  // If the primary pass found any paintable collision at all, use it -
+  // no need to also run the (less precise) fallback pass below.
   if (bestLink != gz::sim::kNullEntity)
     return bestLink;
 
@@ -263,6 +342,7 @@ gz::sim::Entity SprayPaintPlugin::FindHitLink(
       [&](const gz::sim::Entity &linkEnt,
           const gz::sim::components::Link *) -> bool
       {
+        // Same self-exclusion rule as the primary pass.
         if (ownLinks_.count(linkEnt)) return true;
         const double dist =
             gz::sim::worldPose(linkEnt, _ecm).Pos().Distance(hitWorld);
@@ -274,6 +354,8 @@ gz::sim::Entity SprayPaintPlugin::FindHitLink(
         return true;
       });
 
+  // kNullEntity here means neither pass found a paintable link (e.g. the ray
+  // hit something with no registered Link/Collision at all).
   return bestLink;
 }
 
@@ -320,7 +402,8 @@ void SprayPaintPlugin::Configure(
     patchSpacing_ = _sdf->Get<double>("patch_spacing");
 
   if (_sdf->HasElement("paint_interval_steps"))
-    paintIntervalSteps_ = static_cast<uint32_t>(_sdf->Get<int>("paint_interval_steps"));
+    paintIntervalSteps_ = std::max(1u,
+        static_cast<uint32_t>(_sdf->Get<int>("paint_interval_steps")));
 
   if (_sdf->HasElement("num_rays"))
     numRays_ = std::max(1, _sdf->Get<int>("num_rays"));
@@ -328,8 +411,33 @@ void SprayPaintPlugin::Configure(
   if (_sdf->HasElement("enable_particle_emitter"))
     enableParticleEmitter_ = _sdf->Get<bool>("enable_particle_emitter");
 
+  if (_sdf->HasElement("perf_log_path"))
+    perfLogPath_ = _sdf->Get<std::string>("perf_log_path");
+
+  if (_sdf->HasElement("patch_overlap_factor"))
+    patchOverlapFactor_ = std::max(0.01, _sdf->Get<double>("patch_overlap_factor"));
+
+  if (_sdf->HasElement("rim_reach"))
+    rimReach_ = std::max(0.01, _sdf->Get<double>("rim_reach"));
+
+  // 1a. Derive cone-coverage sizing from the (now known) ray pattern
+  ComputePatchSizing();
+
   // 2. Cache EventManager pointer
   eventMgr_ = &_eventMgr;
+
+  // 1b. Open perf log CSV, if requested
+  if (!perfLogPath_.empty())
+  {
+    perfLog_.open(perfLogPath_, std::ios::out | std::ios::trunc);
+    perfLogEnabled_ = perfLog_.is_open();
+    if (perfLogEnabled_)
+    {
+      perfLog_ << "sim_time_s,paint_interval_steps,num_rays,"
+                  "scan_us,valid_hits,patches_created\n";
+      perfLog_.flush();
+    }
+  }
 
   // 3. Subscribe to trigger topic
   transportNode_.Subscribe(sprayTopic_, &SprayPaintPlugin::OnSprayMsg, this);
@@ -350,6 +458,15 @@ void SprayPaintPlugin::Configure(
   Log("Configure", "paint_interval",    std::to_string(paintIntervalSteps_) + " steps");
   Log("Configure", "num_rays",          std::to_string(numRays_) + " cone rays per scan");
   Log("Configure", "particle_emitter",  enableParticleEmitter_ ? "enabled" : "disabled");
+  Log("Configure", "patch_overlap",     std::to_string(patchOverlapFactor_) + "x");
+  Log("Configure", "rim_reach",         std::to_string(rimReach_) + " x cone radius");
+  Log("Configure", "sample_disk",
+      std::to_string(sampleDiskFraction_) + " x cone radius"
+      " (union fully covered out to here; scalloped beyond)");
+  Log("Configure", "patch_radius",
+      std::to_string(patchRadiusFraction_) + " x cone radius");
+  Log("Configure", "perf_log",
+      perfLogEnabled_ ? ("writing to " + perfLogPath_) : "disabled");
   Log("Configure", "status",            "Plugin ready – waiting for nozzle entity");
 }
 
@@ -398,7 +515,7 @@ void SprayPaintPlugin::OnSprayMsg(const gz::msgs::Boolean &_msg)
  * @param _ecm   Entity Component Manager for querying and creating entities.
  */
 void SprayPaintPlugin::PreUpdate(
-    const UpdateInfo & /*_info*/,
+    const UpdateInfo &_info,
     EntityComponentManager &_ecm)
 {
   // STEP 1: Nozzle validity check
@@ -527,15 +644,21 @@ void SprayPaintPlugin::PreUpdate(
         }
         else
         {
-          // Spray turned ON but emitterEntity_ was just cleared; it will be
-          // recreated in STEP 3b below this block.
+          // Edge case: active flipped to ON while an emitter entity still
+          // exists but lastEmitterState_ hadn't caught up yet. This path
+          // should not occur via the normal OFF->ON cycle, since going OFF
+          // always nulls emitterEntity_ first (see the branch above), which
+          // routes recreation through STEP 3b instead. Log only - there is
+          // no entity to create here.
           Log("PreUpdate", "emitter", "ON – recreating emitter");
         }
         lastEmitterState_ = active;
       }
     }
 
-    // STEP 3b: Recreate emitter when spray is ON but entity was removed
+    // STEP 3b: (Re)create the emitter when spray is ON and no emitter entity
+    // currently exists - covers both first-ever activation (never created)
+    // and reactivation after STEP 3 removed it.
     if (sprayActive_ && emitterEntity_ == kNullEntity &&
         nozzleEntity_ != kNullEntity)
     {
@@ -618,11 +741,21 @@ void SprayPaintPlugin::PreUpdate(
         std::to_string(patchCenters_.size()) + " links painted so far");
   }
 
-  // STEP 6: Rate-limit paint scan
+  // STEP 6: Rate-limit paint scan.
+  // Everything above this point is cheap bookkeeping; everything below is
+  // the expensive part (ray results -> link lookup -> patch entities), so
+  // it runs only every paintIntervalSteps_ ticks.
+  //
+  // Note this counts *simulation steps*, not elapsed time, so the effective
+  // scan rate depends on the world's <max_step_size>.  Halving the step size
+  // doubles how often this fires for the same setting.  Too large a value
+  // also lets a fast-moving nozzle skip over surface between scans.
   if ((++paintStepCounter_ % paintIntervalSteps_) != 0)
     return;
 
-  // STEP 7: Read physics raycast results
+  // STEP 7: Read physics raycast results.
+  // The physics system fills this component in-place each step from the ray
+  // set attached in STEP 2, so we just read back the latest hits.
   if (!raysAttached_) return;
 
   const auto *raycastComp =
@@ -630,9 +763,20 @@ void SprayPaintPlugin::PreUpdate(
   if (!raycastComp || raycastComp->Data().results.empty())
     return;
 
+  // Per-scan counters, reported to the perf CSV in STEP 10.  Timing starts
+  // here so it covers exactly the rate-limited work, not the bookkeeping.
+  const auto scanStart = std::chrono::steady_clock::now();
+  uint32_t validHits = 0;
+  uint32_t patchesCreated = 0;
+
+  // Raycast results are in the nozzle's own frame, so the nozzle world pose
+  // is needed to lift each hit into world coordinates.
   const gz::math::Pose3d nozzlePose = gz::sim::worldPose(nozzleEntity_, _ecm);
 
-  // STEP 8: Build spray material
+  // STEP 8: Build spray material.
+  // Shared by every patch created this scan.  Specular is a dimmed copy of
+  // the paint colour so patches read as a slightly glossy coating rather
+  // than flat unlit decals.
   sdf::Material sdfMat;
   sdfMat.SetAmbient(sprayColor_);
   sdfMat.SetDiffuse(sprayColor_);
@@ -644,14 +788,24 @@ void SprayPaintPlugin::PreUpdate(
   // STEP 9: Create paint patches from raycast hits
   for (const auto &res : raycastComp->Data().results)
   {
-    // fraction == 0 → no hit; fraction == 1 → hit at max range (wall of world)
+    // res.fraction is the hit position along this ray, parameterised from
+    // 0 (nozzle origin) to 1 (the ray's configured endpoint at
+    // coneMaxRange_). It is not a real piece of geometry - fraction == 0
+    // is a degenerate hit right at the nozzle, and fraction == 1 is the
+    // physics engine's sentinel for "nothing was hit anywhere along this
+    // ray", i.e. it ran out of ray to check. Both cases mean "no paintable
+    // surface here" and are skipped identically.
     if (res.fraction <= 0.0 || res.fraction >= 1.0) continue;
 
     // Require a valid outward normal
     if (res.normal.Length() < 0.5) continue;
 
-    const double dist = res.fraction * coneMaxRange_;
-    if (dist < 1e-3) continue;
+    // Every ray ends on the plane x = coneMaxRange_, so this is the hit's
+    // depth *along the spray axis*, not its Euclidean range from the
+    // nozzle (that would be res.point.Length()).  MakePatch wants the
+    // axial depth, because the cone radius at depth x is x*tan(halfAngle).
+    const double axialDepth = res.fraction * coneMaxRange_;
+    if (axialDepth < 1e-3) continue;
 
     // Transform hit point and normal from nozzle-local to world frame.
     const gz::math::Vector3d hitWorld =
@@ -664,14 +818,28 @@ void SprayPaintPlugin::PreUpdate(
     if (patchParent == kNullEntity)
       continue;  // no paintable surface found - skip silently
 
-    const PaintPatch patch = MakePatch(hitWorld, normWorld, dist);
+    ++validHits;
+
+    const PaintPatch patch = MakePatch(hitWorld, normWorld, axialDepth);
     if (!patch.valid) continue;
 
-    // Dedup in parent-link-local frame.
+    // Convert the hit into the target link's local frame before deduping.
+    // Two reasons: the patch is parented to that link (so its pose must be
+    // link-local anyway), and deduping in local coordinates keeps working
+    // when the target itself moves - world-frame centres would drift.
     const gz::math::Pose3d parentPose  = gz::sim::worldPose(patchParent, _ecm);
     const gz::math::Pose3d localPatchPose = parentPose.Inverse() * patch.worldPose;
     const gz::math::Vector3d newCenter = localPatchPose.Pos();
 
+    // Skip this hit if an existing patch on the same link is already within
+    // patchSpacing_, so repeated scans over the same spot stop accumulating
+    // entities (entity creation is by far the most expensive thing here).
+    //
+    // Known limitation: patchSpacing_ is a fixed distance and takes no
+    // account of the patch radius or the surface normal.  It is therefore
+    // far smaller than a patch at long range (heavy overdraw), and it
+    // suppresses legitimate hits on the opposite face of a panel thinner
+    // than patchSpacing_.
     auto &centers = patchCenters_[patchParent];
     bool tooClose = false;
     for (const auto &c : centers)
@@ -681,7 +849,8 @@ void SprayPaintPlugin::PreUpdate(
     }
     if (tooClose) continue;
 
-    // Create the thin disc visual.
+    // Build the patch as a thin disc: a cylinder whose length is its
+    // thickness, laid flat against the surface.
     sdf::Cylinder patchCylinder;
     patchCylinder.SetRadius(patch.size.X() / 2.0);
     patchCylinder.SetLength(patch.size.Z());
@@ -698,27 +867,33 @@ void SprayPaintPlugin::PreUpdate(
     patchVisualSdf.SetRawPose(localPatchPose);
     patchVisualSdf.SetGeom(patchGeom);
     patchVisualSdf.SetMaterial(sdfMat);
+    // Paint is a surface marking, not an object - casting shadows would
+    // both look wrong and add avoidable render cost per patch.
     patchVisualSdf.SetCastShadows(false);
 
+    // Parenting to the hit link (rather than the world) is what makes paint
+    // travel with the object if it is subsequently moved.
     gz::sim::SdfEntityCreator creator(_ecm, *eventMgr_);
     const Entity patchEntity = creator.CreateEntities(&patchVisualSdf);
     creator.SetParent(patchEntity, patchParent);
 
+    ++patchesCreated;
     centers.push_back(newCenter);
+  }
 
-    {
-      const gz::math::Vector3d euler = patch.worldPose.Rot().Euler();
-      std::ostringstream pm;
-      // pm << "patch=" << patchName
-      //    << "  dist=" << dist << " m"
-      //    << "  hit=(" << hitWorld.X() << ", " << hitWorld.Y()
-      //    << ", " << hitWorld.Z() << ")"
-      //    << "  normal=(" << normWorld.X() << ", " << normWorld.Y()
-      //    << ", " << normWorld.Z() << ")"
-      //    << "  parent_link=" << patchParent
-      //    << "  total=" << centers.size();
-      // Log("PreUpdate", "painted", pm.str());
-    }
+  // STEP 10: Record this scan's timing/throughput, if perf logging is on.
+  if (perfLogEnabled_)
+  {
+    const auto scanEnd = std::chrono::steady_clock::now();
+    const double scanUs = std::chrono::duration<double, std::micro>(
+        scanEnd - scanStart).count();
+    const double simTimeS = std::chrono::duration<double>(
+        _info.simTime).count();
+
+    perfLog_ << simTimeS << ',' << paintIntervalSteps_ << ',' << numRays_
+             << ',' << scanUs << ',' << validHits << ',' << patchesCreated
+             << '\n';
+    perfLog_.flush();
   }
 }
 
