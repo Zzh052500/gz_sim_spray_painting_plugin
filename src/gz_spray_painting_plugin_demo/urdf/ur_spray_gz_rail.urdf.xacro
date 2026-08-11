@@ -1,14 +1,27 @@
 <?xml version="1.0"?>
 <!--
-  ur_spray_gz.urdf.xacro
-  ======================
-  Extended UR5e description that includes the standard UR arm plus the spray
-  painting tool attached to tool0.
+  ur_spray_gz_rail.urdf.xacro
+  ============================
+  Rail-mounted variant of ur_spray_gz.urdf.xacro: the UR5e + spray tool
+  sits on a carriage that slides along a linear rail (rail_axis.xacro)
+  instead of a fixed pedestal, mimicking a real gantry-mounted spray-paint
+  cell for objects too large for the arm's own reach (cars, aircraft
+  panels).
 
-  Robot xacro and configs are resolved from gz_spray_painting_plugin_demo.
+  This is a deliberate fork of ur_spray_gz.urdf.xacro rather than a
+  conditional branch inside it, so the existing fixed-base demo
+  (ur_spray_demo.launch.py) is completely unaffected by this file.
+
+  The rail adds exactly one new ros2_control joint, rail_to_carriage
+  (prismatic), on top of the 6 existing arm joints. It is driven by its own
+  independent controller (rail_trajectory_controller, see
+  ur_sim_controllers_rail.yaml) — it is NOT part of the MoveIt
+  "ur_manipulator" planning group, so IK/motion planning for the arm is
+  unchanged; the rail is simply positioned before each spray pass by
+  rail_spray_demo.py.
 
   Usage (from launch file):
-    xacro ur_spray_gz.urdf.xacro ur_type:=ur5e simulation_controllers:=<path>
+    xacro ur_spray_gz_rail.urdf.xacro ur_type:=ur5e simulation_controllers:=<path>
 -->
 <robot xmlns:xacro="http://wiki.ros.org/xacro" name="ur">
 
@@ -32,7 +45,7 @@
   <xacro:arg name="ros_namespace"          default=""/>
 
   <!-- Spray tool args (override in launch as needed) -->
-  <xacro:arg name="cone_half_angle_deg"      default="10"/>
+  <xacro:arg name="cone_half_angle_deg"      default="11.5"/>
   <xacro:arg name="cone_max_range"           default="0.8"/>
   <xacro:arg name="spray_color"              default="1.0 0.2 0.1 1.0"/>
   <xacro:arg name="spray_topic"              default="/spray_paint/trigger"/>
@@ -45,16 +58,27 @@
   <xacro:arg name="patch_overlap_factor"     default="1.30"/>
   <xacro:arg name="rim_reach"                default="1.12"/>
 
+  <!-- Rail args -->
+  <xacro:arg name="rail_length"              default="3.0"/>
+  <xacro:property name="rail_length"         value="$(arg rail_length)"/>
+  <xacro:property name="post_height"         value="0.75"/>
+
   <!-- Standard UR arm kinematic description (no ros2_control tag yet) -->
   <xacro:include filename="$(find gz_spray_painting_plugin_demo)/urdf/ur_macro.xacro"/>
+  <xacro:include filename="$(find gz_spray_painting_plugin_demo)/urdf/rail_axis.xacro"/>
 
   <!-- world anchor -->
   <link name="world"/>
 
+  <!-- Rail: fixed to world, carriage rides along +Y. post_height must match
+       the origin z below, where the arm is welded on top of the post. -->
+  <xacro:rail_axis parent="world" rail_length="$(arg rail_length)"
+                    post_height="${post_height}"/>
+
   <xacro:ur_robot
     name="$(arg name)"
     tf_prefix="$(arg tf_prefix)"
-    parent="world"
+    parent="rail_carriage"
     joint_limits_parameters_file="$(arg joint_limit_params)"
     kinematics_parameters_file="$(arg kinematics_params)"
     physical_parameters_file="$(arg physical_params)"
@@ -63,7 +87,7 @@
     safety_pos_margin="$(arg safety_pos_margin)"
     safety_k_position="$(arg safety_k_position)"
     generate_ros2_control_tag="false">
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="0 0 ${post_height}" rpy="0 0 0"/>
   </xacro:ur_robot>
 
   <gazebo reference="world"/>
@@ -85,11 +109,31 @@
     ur_joint_control.xacro (not needed for the UR5e spray demo).
     Only position + velocity command interfaces are exposed — sufficient
     for joint_trajectory_controller / MoveIt.
+
+    rail_to_carriage is listed here alongside the arm joints (single
+    ros2_control tag, single gz_ros2_control plugin instance — that's how
+    ros2_control/gz_ros2_control expect it), but it is driven by a
+    completely separate controller (rail_trajectory_controller) from the
+    arm's (joint_trajectory_controller), so the two axes are commanded
+    independently.
   -->
   <ros2_control name="$(arg name)" type="system">
     <hardware>
       <plugin>gz_ros2_control/GazeboSimSystem</plugin>
     </hardware>
+
+    <joint name="rail_to_carriage">
+      <command_interface name="position">
+        <param name="min">${-rail_length / 2.0}</param>
+        <param name="max">${rail_length / 2.0}</param>
+      </command_interface>
+      <command_interface name="velocity"/>
+      <state_interface name="position">
+        <param name="initial_value">0.0</param>
+      </state_interface>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+    </joint>
 
     <joint name="$(arg tf_prefix)shoulder_pan_joint">
       <command_interface name="position"/>

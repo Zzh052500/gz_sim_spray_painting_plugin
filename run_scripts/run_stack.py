@@ -7,17 +7,28 @@ scanning the installed worlds directory, then creates the appropriate tmux
 session and attaches.
 
 World mode is determined solely by filename:
-  car_painting.sdf  →  UR mode  (UR5e + MoveIt + cartesian spray)
-  everything else   →  demo mode (Gazebo + spray nozzle only)
+  demo_car.sdf       →  UR mode   (UR5e + MoveIt + cartesian spray, fixed pedestal)
+  demo_car_rail.sdf  →  rail mode (UR5e + MoveIt on a rail carriage + rail_spray_demo)
+  everything else    →  demo mode (Gazebo + spray nozzle only)
 
 Adding or removing .sdf files from the worlds directory automatically updates
-the menu — no code changes required.
+the menu — no code changes required. To add another robot-bearing world,
+add its stem to a mode mapping above (or extend the tmux layouts below);
+otherwise it silently falls into demo mode's nozzle-only launch file, which
+looks like "nothing spawned" if the world was actually meant for a full
+robot stack.
 
 tmux layouts
 ────────────
   UR mode:
     Window 0 – sim            : ur_spray_demo.launch.py (Gazebo + UR5e + MoveIt)
     Window 1 – cartesian_spray: cartesian_spray.launch.py (auto-runs after 20 s)
+    Window 2 – spray_control  : spray ON/OFF pre-typed
+
+  Rail mode:
+    Window 0 – sim            : ur_spray_rail_demo.launch.py (Gazebo + UR5e-on-rail + MoveIt)
+    Window 1 – rail_spray     : rail_spray_demo.py (auto-runs after 30 s — controllers
+                                 spawn later here, ~T+27s, than in UR mode's ~T+25s)
     Window 2 – spray_control  : spray ON/OFF pre-typed
 
   Demo mode:
@@ -33,7 +44,8 @@ SESSION   = "spray_paint"
 TMUX_CONF = "/tmp/.tmux_spray.conf"
 ROS       = ". /opt/ros/humble/setup.bash && . /ws/install/setup.bash 2>/dev/null || true"
 
-UR_WORLD  = "demo_car"
+UR_WORLD   = "demo_car"
+RAIL_WORLD = "demo_car_rail"
 
 # ── Discover worlds dynamically ───────────────────────────────────────────────
 # Prefer installed share directory; fall back to source tree.
@@ -45,8 +57,15 @@ if not os.path.isdir(WORLDS_DIR):
     print(f"  Error: worlds directory not found at:\n  {_INSTALLED}\n  {_SOURCE}")
     sys.exit(1)
 
+def _mode_for(stem: str) -> str:
+    if stem == UR_WORLD:
+        return "ur"
+    if stem == RAIL_WORLD:
+        return "rail"
+    return "demo"
+
 def _label(stem: str) -> str:
-    suffix = " (UR5e robot)" if stem == UR_WORLD else ""
+    suffix = {"ur": " (UR5e robot)", "rail": " (UR5e robot on rail)"}.get(_mode_for(stem), "")
     return stem.replace("_", " ").title() + suffix
 
 # Build menu: car_painting first (if present), rest alphabetically.
@@ -58,7 +77,7 @@ _stems = sorted(
 if UR_WORLD in _stems:
     _stems = [UR_WORLD] + [s for s in _stems if s != UR_WORLD]
 
-WORLDS = [(_label(s), s, "ur" if s == UR_WORLD else "demo") for s in _stems]
+WORLDS = [(_label(s), s, _mode_for(s)) for s in _stems]
 
 if not WORLDS:
     print("  Error: no .sdf worlds found in", WORLDS_DIR)
@@ -109,6 +128,28 @@ if mode == "ur":
     tmux("new-window", "-t", SESSION, "-n", "cartesian_spray")
     send("cartesian_spray.0",
          f"sleep 20 && {ROS} && ros2 launch gz_spray_painting_plugin_demo cartesian_spray.launch.py")
+
+    # ── Window 2: spray_control ───────────────────────────────────────────────
+    tmux("new-window", "-t", SESSION, "-n", "spray_control")
+    send("spray_control.0",
+         'gz topic -t /spray_paint/trigger -m gz.msgs.Boolean -p "data: true"', enter=False)
+    tmux("split-window", "-t", f"{SESSION}:spray_control", "-v", "-p", "50")
+    send("spray_control.1",
+         'gz topic -t /spray_paint/trigger -m gz.msgs.Boolean -p "data: false"', enter=False)
+    tmux("select-pane", "-t", f"{SESSION}:spray_control.0")
+
+elif mode == "rail":
+    # ── Window 0: sim (UR5e-on-rail stack) ────────────────────────────────────
+    tmux("new-session", "-d", "-s", SESSION, "-n", "sim", "-x", "220", "-y", "50")
+    send("sim.0", f"{ROS} && ros2 launch gz_spray_painting_plugin_demo ur_spray_rail_demo.launch.py")
+
+    # ── Window 1: rail_spray ───────────────────────────────────────────────────
+    # 30 s, not 20 like UR mode's cartesian_spray window: this world's
+    # controllers finish spawning later (rail_trajectory_controller at
+    # ~T+27s vs the arm's joint_trajectory_controller at ~T+25s in UR mode).
+    tmux("new-window", "-t", SESSION, "-n", "rail_spray")
+    send("rail_spray.0",
+         f"sleep 30 && {ROS} && ros2 run gz_spray_painting_plugin_demo rail_spray_demo.py")
 
     # ── Window 2: spray_control ───────────────────────────────────────────────
     tmux("new-window", "-t", SESSION, "-n", "spray_control")

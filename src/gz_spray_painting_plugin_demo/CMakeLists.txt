@@ -13,6 +13,7 @@ install(PROGRAMS
   scripts/cartesian_path_executor.py
   scripts/spray_painting_demo.py
   scripts/generate_spray_poses.py
+  scripts/rail_spray_demo.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

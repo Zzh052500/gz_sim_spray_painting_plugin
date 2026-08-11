@@ -1,20 +1,33 @@
 """
-ur_spray_demo.launch.py
-=======================
-Single entry-point for the UR5e spray painting demo:
+ur_spray_rail_demo.launch.py
+=============================
+Rail-mounted variant of ur_spray_demo.launch.py: the UR5e + spray tool
+rides on a carriage that slides along a linear rail instead of sitting on a
+fixed pedestal, mimicking a real gantry-mounted spray-paint cell for
+objects too large for the arm's own reach (cars, aircraft panels).
 
-  * Gazebo Harmonic          :loads car_painting.sdf world
-  * ros_gz_bridge            :/clock (GZ→ROS) + /spray_paint/trigger (ROS→GZ)
-  * robot_state_publisher    :publishes TF from the spray URDF
-  * joint_state_publisher    :provides correct initial pose until JSB starts
-  * gz service create        :injects the robot at T+8 s
-  * controller spawners      :joint_state_broadcaster (T+20 s) +
-                               joint_trajectory_controller (T+25 s)
-  * MoveIt 2                 :move_group + RViz
+Structurally identical to ur_spray_demo.launch.py (same node graph, same
+staggered spawn timing) except for:
+  * robot description : ur_spray_gz_rail.urdf.xacro (adds rail_to_carriage)
+  * controllers        : ur_sim_controllers_rail.yaml (adds
+                          rail_trajectory_controller, independent from the
+                          arm's joint_trajectory_controller)
+  * world              : demo_car_rail.sdf (same car, no pedestal - the
+                          rail assembly is its own support)
+  * spawn pose         : z=0 (ground level) - the rail + support post
+                          height is now baked into the URDF itself, unlike
+                          the fixed-base demo which spawns at z=0.80 to sit
+                          on top of a separate static pedestal model.
+
+The rail is driven independently of MoveIt: rail_spray_demo.py positions it
+before each spray pass via rail_trajectory_controller, while the arm's
+6-DOF "ur_manipulator" MoveIt planning group is unchanged from the
+fixed-base demo.
 
 Usage:
-  ros2 launch gz_spray_painting_plugin_demo ur_spray_demo.launch.py
-  ros2 launch gz_spray_painting_plugin_demo ur_spray_demo.launch.py headless:=true
+  ros2 launch gz_spray_painting_plugin_demo ur_spray_rail_demo.launch.py
+  ros2 launch gz_spray_painting_plugin_demo ur_spray_rail_demo.launch.py headless:=true
+  ros2 launch gz_spray_painting_plugin_demo ur_spray_rail_demo.launch.py rail_length:=4.0
 """
 
 import os
@@ -42,6 +55,7 @@ def launch_setup(context, *args, **kwargs):
     headless             = LaunchConfiguration("headless")
     paint_interval_steps = LaunchConfiguration("paint_interval_steps").perform(context)
     perf_log_path        = LaunchConfiguration("perf_log_path").perform(context)
+    rail_length           = LaunchConfiguration("rail_length").perform(context)
 
     # Plugin package: libSprayPaintPlugin.so
     spray_pkg_prefix = get_package_prefix("gz_sim_spray_painting_plugin")
@@ -49,9 +63,9 @@ def launch_setup(context, *args, **kwargs):
     # Demo package: URDF, configs, worlds, models, RViz
     demo_pkg_share = get_package_share_directory("gz_spray_painting_plugin_demo")
 
-    description_file = os.path.join(demo_pkg_share, "urdf", "ur_spray_gz.urdf.xacro")
+    description_file = os.path.join(demo_pkg_share, "urdf", "ur_spray_gz_rail.urdf.xacro")
     controllers_file = PathJoinSubstitution(
-        [FindPackageShare("gz_spray_painting_plugin_demo"), "config", "ur_sim_controllers.yaml"]
+        [FindPackageShare("gz_spray_painting_plugin_demo"), "config", "ur_sim_controllers_rail.yaml"]
     ).perform(context)
 
     # ── Build robot description URDF ─────────────────────────────────────────
@@ -64,6 +78,7 @@ def launch_setup(context, *args, **kwargs):
         "tf_prefix:=",
         f"paint_interval_steps:={paint_interval_steps}",
         f"perf_log_path:={perf_log_path}",
+        f"rail_length:={rail_length}",
     ]
     xacro_env = os.environ.copy()
     demo_pkg_prefix = "/ws/install/gz_spray_painting_plugin_demo"
@@ -90,7 +105,7 @@ def launch_setup(context, *args, **kwargs):
         ],
     )
 
-    world_path = os.path.join(demo_pkg_share, "worlds", "demo_car.sdf")
+    world_path = os.path.join(demo_pkg_share, "worlds", "demo_car_rail.sdf")
 
     gazebo = ExecuteProcess(
         cmd=["gz", "sim", world_path, "-r", "-v", "4"],
@@ -133,12 +148,17 @@ def launch_setup(context, *args, **kwargs):
                 "zeros.elbow_joint":          1.5708,
                 "zeros.wrist_1_joint":        -1.5708,
                 "zeros.wrist_2_joint":        -1.5708,
+                "zeros.rail_to_carriage":      0.0,
             },
         ],
     )
 
     # ── Spawn robot at T+8 s ──────────────────────────────────────────────────
-    urdf_tmp = "/tmp/ur_spray_generated.urdf"
+    # z=0: the rail track sits directly on the ground, and the support post
+    # that the fixed-base demo gets from a separate pedestal model is now
+    # baked into the URDF's rail_carriage link (see rail_axis.xacro),
+    # already accounted for by the xacro's own origin offset onto base_link.
+    urdf_tmp = "/tmp/ur_spray_rail_generated.urdf"
     with open(urdf_tmp, "w") as f:
         f.write(urdf_str)
 
@@ -147,7 +167,7 @@ def launch_setup(context, *args, **kwargs):
         actions=[ExecuteProcess(
             cmd=[
                 "gz", "service",
-                "-s", "/world/demo_car/create",
+                "-s", "/world/demo_car_rail/create",
                 "--reqtype", "gz.msgs.EntityFactory",
                 "--reptype", "gz.msgs.Boolean",
                 "--timeout", "30000",
@@ -156,7 +176,7 @@ def launch_setup(context, *args, **kwargs):
                     f'sdf_filename: "{urdf_tmp}" '
                     f'name: "ur" '
                     f'allow_renaming: false '
-                    f'pose: {{ position: {{x: 0.0 y: 0.0 z: 0.80}} '
+                    f'pose: {{ position: {{x: 0.0 y: 0.0 z: 0.0}} '
                     f'orientation: {{x: 0 y: 0 z: 0.7071 w: 0.7071}} }}'
                 ),
             ],
@@ -191,8 +211,27 @@ def launch_setup(context, *args, **kwargs):
             output="screen",
         )],
     )
+    # Staggered a couple seconds after the arm's controller so the two
+    # `controller_manager/spawner` processes don't race the same service.
+    rail_trajectory_controller_spawner = TimerAction(
+        period=27.0,
+        actions=[Node(
+            package="controller_manager",
+            executable="spawner",
+            arguments=[
+                "rail_trajectory_controller",
+                "-c", "/controller_manager",
+                "--controller-manager-timeout", "60",
+            ],
+            output="screen",
+        )],
+    )
 
     # ── MoveIt 2 ─────────────────────────────────────────────────────────────
+    # Unchanged from ur_spray_demo.launch.py: the SRDF chain only ever knew
+    # about the 6 arm joints (base_link -> tool0, tip patched to the nozzle
+    # below), so it needs no changes for the rail — the rail sits entirely
+    # outside this planning group and is driven separately, above.
     moveit_actions = []
     try:
         from ur_moveit_config.launch_common import load_yaml  # noqa: PLC0415
@@ -277,20 +316,10 @@ def launch_setup(context, *args, **kwargs):
             ],
         )
 
-        # rviz_cfg = os.path.join(demo_pkg_share, "config", "moveit.rviz")
-        # rviz_node = Node(
-        #     package="rviz2",
-        #     executable="rviz2",
-        #     name="rviz2_moveit",
-        #     output="log",
-        #     arguments=["-d", rviz_cfg],
-        #     parameters=common_params,
-        # )
-
-        moveit_actions = [move_group_node]  # rviz_node disabled
+        moveit_actions = [move_group_node]
 
     except Exception as exc:
-        print(f"\n[ur_spray_demo] MoveIt failed to load, skipping.\n"
+        print(f"\n[ur_spray_rail_demo] MoveIt failed to load, skipping.\n"
               f"  Error: {exc}\n{traceback.format_exc()}")
 
     return [
@@ -304,6 +333,7 @@ def launch_setup(context, *args, **kwargs):
         spawn_robot,
         joint_state_broadcaster_spawner,
         joint_trajectory_controller_spawner,
+        rail_trajectory_controller_spawner,
         *moveit_actions,
     ]
 
@@ -323,10 +353,16 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "perf_log_path",
-            default_value="/ws/file_logs/spray_perf_n10.csv",
+            default_value="/ws/file_logs/spray_perf_rail.csv",
             description="CSV path for per-scan plugin timing "
                         "(sim_time_s,paint_interval_steps,num_rays,scan_us,valid_hits,patches_created). "
                         "Empty disables perf logging.",
+        ),
+        DeclareLaunchArgument(
+            "rail_length",
+            default_value="3.0",
+            description="Total travel length of the rail (m). The carriage "
+                        "can move from -rail_length/2 to +rail_length/2.",
         ),
         SetEnvironmentVariable(name="GZ_VERSION", value="harmonic"),
         OpaqueFunction(function=launch_setup),
