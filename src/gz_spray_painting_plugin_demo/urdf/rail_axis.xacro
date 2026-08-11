@@ -1,0 +1,125 @@
+<?xml version="1.0"?>
+<!--
+  rail_axis.xacro
+  ================
+  A static linear rail plus a moving carriage, connected by a single
+  prismatic joint. Mimics a real spray-painting gantry/rail cell: a
+  short-reach arm is mounted on the carriage and slides along the rail to
+  cover a target far longer than the arm's own workspace (e.g. a car body
+  or an aircraft panel).
+
+  The carriage link also carries a vertical support post, rigidly built
+  into the same link (no extra joint) — it plays the same role the static
+  "robot_pedestal" model plays in the fixed-base demo, just now riding on
+  the carriage instead of being bolted to the ground. Whatever gets
+  attached to the carriage (e.g. xacro:ur_robot with parent="${carriage}")
+  should be offset up by post_height so it sits on top of the post.
+
+  Usage:
+    <xacro:include filename="$(find gz_spray_painting_plugin_demo)/urdf/rail_axis.xacro"/>
+    <xacro:rail_axis parent="world" rail_length="3.0" post_height="0.75"/>
+    ...then mount the payload with parent="rail_carriage" and
+    <origin xyz="0 0 ${post_height}" .../> (post_height must match).
+-->
+<robot xmlns:xacro="http://wiki.ros.org/xacro">
+
+  <xacro:macro name="rail_axis"
+      params="parent:=world rail_length:=3.0 track_height:=0.05
+              plate_height:=0.05 post_radius:=0.15 post_height:=0.75
+              carriage_size:=0.4">
+
+    <!-- Static rail track, fixed to the world (or whatever parent is given).
+         Runs along +Y so it sits parallel to the car's long axis in
+         demo_car_rail.sdf. Track cross-section is intentionally slim; only
+         its length and top surface height matter for the carriage to ride on. -->
+    <link name="rail_track">
+      <visual>
+        <origin xyz="0 0 ${track_height/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.2 ${rail_length} ${track_height}"/>
+        </geometry>
+        <material name="rail_black">
+          <color rgba="0.02 0.02 0.02 1.0"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 ${track_height/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.2 ${rail_length} ${track_height}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <!-- Static link (fixed joint to parent below) - inertial values are
+             unused by the physics engine but required for a valid URDF link. -->
+        <mass value="50.0"/>
+        <inertia ixx="1.0" ixy="0" ixz="0" iyy="1.0" iyz="0" izz="1.0"/>
+      </inertial>
+    </link>
+
+    <joint name="rail_mount" type="fixed">
+      <parent link="${parent}"/>
+      <child  link="rail_track"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <!-- Moving carriage: a plate riding on the track, with a vertical post
+         rigidly attached on top (the arm's own mount point). Both are part
+         of the same rigid body since nothing needs to move between them. -->
+    <link name="rail_carriage">
+      <visual name="carriage_plate">
+        <origin xyz="0 0 ${plate_height/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <box size="${carriage_size} ${carriage_size} ${plate_height}"/>
+        </geometry>
+        <material name="carriage_dark">
+          <color rgba="0.15 0.15 0.15 1.0"/>
+        </material>
+      </visual>
+      <collision name="carriage_plate_collision">
+        <origin xyz="0 0 ${plate_height/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <box size="${carriage_size} ${carriage_size} ${plate_height}"/>
+        </geometry>
+      </collision>
+
+      <visual name="carriage_post">
+        <origin xyz="0 0 ${plate_height + post_height/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${post_radius}" length="${post_height}"/>
+        </geometry>
+        <material name="post_red">
+          <color rgba="0.5 0.0 0.0 1.0"/>
+        </material>
+      </visual>
+      <collision name="carriage_post_collision">
+        <origin xyz="0 0 ${plate_height + post_height/2.0}" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${post_radius}" length="${post_height}"/>
+        </geometry>
+      </collision>
+
+      <inertial>
+        <origin xyz="0 0 ${plate_height + post_height/2.0}" rpy="0 0 0"/>
+        <mass value="20.0"/>
+        <inertia ixx="1.0" ixy="0" ixz="0" iyy="1.0" iyz="0" izz="1.0"/>
+      </inertial>
+    </link>
+
+    <joint name="rail_to_carriage" type="prismatic">
+      <axis xyz="0 1 0"/>
+      <origin xyz="0 0 ${track_height}" rpy="0 0 0"/>
+      <parent link="rail_track"/>
+      <child  link="rail_carriage"/>
+      <!-- velocity doubled alongside RAIL_MAX_SPEED in rail_spray_demo.py -
+           keep this comfortably above whatever that script actually
+           commands, or moves become kinematically infeasible and get
+           truncated short of their target (see rail_spray_demo.py's
+           module docstring for the earlier bug this caused). -->
+      <limit effort="5000.0" lower="${-rail_length/2.0}" upper="${rail_length/2.0}"
+             velocity="0.6"/>
+      <dynamics damping="50.0" friction="10.0"/>
+    </joint>
+
+  </xacro:macro>
+
+</robot>
