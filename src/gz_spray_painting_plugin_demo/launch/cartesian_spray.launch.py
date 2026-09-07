@@ -49,6 +49,15 @@ def generate_launch_description():
             default_value="true",
             description="Publish spray trigger around execution.",
         ),
+        DeclareLaunchArgument(
+            "trigger_method",
+            default_value="gz_cli",
+            description="How the executor toggles spray: gz_cli (direct gz "
+                        "topic publish — reliable with the Fortress-built "
+                        "ros_gz_bridge in this container) or ros (via the "
+                        "ROS → ros_gz_bridge path, which currently cannot "
+                        "reach the plugin).",
+        ),
         Node(
             package="gz_spray_painting_plugin_demo",
             executable="cartesian_path_executor.py",
@@ -61,6 +70,7 @@ def generate_launch_description():
                 "eef_step":         LaunchConfiguration("eef_step"),
                 "velocity_scaling": LaunchConfiguration("velocity_scaling"),
                 "spray_enabled":    LaunchConfiguration("spray_enabled"),
+                "trigger_method":   LaunchConfiguration("trigger_method"),
             }],
         ),
     ])

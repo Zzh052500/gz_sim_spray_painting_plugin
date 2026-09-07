@@ -39,7 +39,8 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def launch_setup(context, *args, **kwargs):
-    headless             = LaunchConfiguration("headless")
+    world_stem          = LaunchConfiguration("world").perform(context)
+    headless            = LaunchConfiguration("headless")
     paint_interval_steps = LaunchConfiguration("paint_interval_steps").perform(context)
     perf_log_path        = LaunchConfiguration("perf_log_path").perform(context)
 
@@ -86,11 +87,12 @@ def launch_setup(context, *args, **kwargs):
         name="GZ_SIM_RESOURCE_PATH",
         value=[
             os.path.dirname(demo_pkg_share) + ":",
+            os.path.join(demo_pkg_share, "models") + ":",
             EnvironmentVariable("GZ_SIM_RESOURCE_PATH", default_value=""),
         ],
     )
 
-    world_path = os.path.join(demo_pkg_share, "worlds", "demo_car.sdf")
+    world_path = os.path.join(demo_pkg_share, "worlds", f"{world_stem}.sdf")
 
     gazebo = ExecuteProcess(
         cmd=["gz", "sim", world_path, "-r", "-v", "4"],
@@ -139,15 +141,20 @@ def launch_setup(context, *args, **kwargs):
 
     # ── Spawn robot at T+8 s ──────────────────────────────────────────────────
     urdf_tmp = "/tmp/ur_spray_generated.urdf"
-    with open(urdf_tmp, "w") as f:
-        f.write(urdf_str)
+    try:
+        with open(urdf_tmp, "w") as f:
+            f.write(urdf_str)
+    except PermissionError:
+        urdf_tmp = os.path.expanduser("~/ur_spray_generated.urdf")
+        with open(urdf_tmp, "w") as f:
+            f.write(urdf_str)
 
     spawn_robot = TimerAction(
         period=8.0,
         actions=[ExecuteProcess(
             cmd=[
                 "gz", "service",
-                "-s", "/world/demo_car/create",
+                "-s", f"/world/{world_stem}/create",
                 "--reqtype", "gz.msgs.EntityFactory",
                 "--reptype", "gz.msgs.Boolean",
                 "--timeout", "30000",
@@ -310,6 +317,13 @@ def launch_setup(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "world",
+            default_value="demo_car",
+            description="SDF world stem (filename without .sdf), e.g. "
+                        "demo_car or demo_cabinet. The gz create service and "
+                        "world path both follow this stem.",
+        ),
         DeclareLaunchArgument(
             "headless",
             default_value="false",
