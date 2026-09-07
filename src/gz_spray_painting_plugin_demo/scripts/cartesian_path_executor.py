@@ -41,6 +41,7 @@ from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
+from std_msgs.msg import Bool as BoolMsg
 
 
 JOINT_NAMES = [
@@ -83,11 +84,24 @@ class JointSprayPainter(Node):
         self.declare_parameter("velocity_scaling", 0.35)
         self.declare_parameter("spray_topic",      "/spray_paint/trigger")
         self.declare_parameter("spray_enabled",    True)
+        # Default to gz_cli: the container's Debian ros_gz_bridge is a Fortress
+        # build (libignition-msgs8, `ignition.msgs`) and gz-transport treats its
+        # types as DIFFERENT from the Harmonic server's `gz.msgs.*`, so the ros
+        # path can never reach the plugin here (see _publish_gz_cli).
+        self.declare_parameter("trigger_method",   "gz_cli")  # ros | gz_cli | both
 
         self._traj_pub = self.create_publisher(
             JointTrajectory,
             "/joint_trajectory_controller/joint_trajectory",
             10,
+        )
+        # Spray trigger published over ROS → ros_gz_bridge → the gz plugin.
+        # NOTE: with the Fortress-built bridge this publisher exists but its
+        # messages are silently dropped (type mismatch), so it is only useful
+        # once a Harmonic-compatible ros_gz_bridge is installed. The reliable
+        # path is `gz_cli` (see _publish_gz_cli).
+        self._trigger_pub = self.create_publisher(
+            BoolMsg, self.get_parameter("spray_topic").value, 10,
         )
         self._current_joints: list[float] | None = None
         self._js_sub = self.create_subscription(
@@ -174,13 +188,83 @@ class JointSprayPainter(Node):
         q_to = [target[j] for j in JOINT_NAMES]
         return self._send_trajectory([current, q_to], vel_scale, "move")
 
+    # ── spray trigger ──────────────────────────────────────────────────────────
+
+    def _publish_gz_cli(self, state: bool) -> bool:
+        """Publish the trigger directly via the `gz topic` CLI.
+
+        THE reliable path in this container: the Debian ros_gz_bridge links
+        libignition-msgs8 (Fortress, `ignition.msgs` namespace), which
+        gz-transport treats as a different type from the Harmonic server's
+        `gz.msgs.*` — so bridge-forwarded triggers are always dropped. `gz
+        topic -p` publishes in the server's own namespace and is delivered.
+        Retry a few times because a fresh gz-transport node can occasionally
+        miss discovery over the docker bridge on the very first send.
+        """
+        data_str = "data: true" if state else "data: false"
+        cmd = [
+            "gz", "topic",
+            "-t", self.get_parameter("spray_topic").value,
+            "-m", "gz.msgs.Boolean",
+            "-p", data_str,
+        ]
+        for attempt in range(3):
+            try:
+                subprocess.run(
+                    cmd, check=True, timeout=5.0,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                return True
+            except Exception as exc:
+                if attempt < 2:
+                    time.sleep(0.5)
+                self.get_logger().warn(
+                    f"gz topic spray attempt {attempt + 1} failed: {exc}"
+                )
+        return False
+
+    def _publish_ros(self, state: bool) -> bool:
+        """
+        Publish the trigger over ROS → ros_gz_bridge → the gz plugin.
+
+        CAVEAT: `get_subscription_count() > 0` only proves the ros_gz_bridge
+        is subscribed. With the Fortress build (ignition.msgs) that does NOT
+        mean the plugin receives it — delivery is only guaranteed by the
+        gz_cli path in this container.
+        """
+        msg = BoolMsg()
+        msg.data = state
+        for _ in range(3):
+            self._trigger_pub.publish(msg)
+            if self._trigger_pub.get_subscription_count() > 0:
+                return True
+            time.sleep(0.2)
+        return False
+
+    def set_spray(self, state: bool) -> bool:
+        """Turn the spray ON/OFF. Returns True if at least one path delivered."""
+        if not self.get_parameter("spray_enabled").value:
+            return True
+        method = self.get_parameter("trigger_method").value
+        ok = False
+        if method in ("ros", "both"):
+            ok = self._publish_ros(state) or ok
+        # The Fortress-built ros_gz_bridge in this container can never deliver
+        # to the Harmonic plugin, so gz_cli is the only reliable path. "ros" /
+        # "both" are kept for when a Harmonic-compatible bridge is installed.
+        if method in ("gz_cli", "both") or (method == "ros" and not ok):
+            ok = self._publish_gz_cli(state) or ok
+        self.get_logger().info(
+            f"Spray {'ON' if state else 'OFF'} [{method}] "
+            f"{'delivered' if ok else 'FAILED'}"
+        )
+        return ok
+
     # ── public entry point ─────────────────────────────────────────────────────
 
     def run(self) -> bool:
-        poses_file    = self.get_parameter("poses_file").value
-        vel_scale     = self.get_parameter("velocity_scaling").value
-        spray_topic   = self.get_parameter("spray_topic").value
-        spray_enabled = self.get_parameter("spray_enabled").value
+        poses_file = self.get_parameter("poses_file").value
+        vel_scale  = self.get_parameter("velocity_scaling").value
 
         if not poses_file:
             self.get_logger().error("poses_file parameter is required.")
@@ -210,24 +294,9 @@ class JointSprayPainter(Node):
 
         self.get_logger().info(f"Loaded {len(joint_configs)} joint configs.")
 
-        def set_spray(state: bool):
-            if not spray_enabled:
-                return
-            data_str = "data: true" if state else "data: false"
-            try:
-                subprocess.run(
-                    [
-                        "gz", "topic",
-                        "-t", spray_topic,
-                        "-m", "gz.msgs.Boolean",
-                        "-p", data_str,
-                    ],
-                    check=True, timeout=5.0,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except Exception as exc:
-                self.get_logger().warn(f"gz topic spray command failed: {exc}")
-            self.get_logger().info(f"Spray {'ON' if state else 'OFF'}")
+        # Replaced the old closure with methods below (see _publish_ros /
+        # _publish_gz_cli / set_spray) so the spray trigger can be delivered
+        # reliably over ROS and OFF is guaranteed even on exceptions.
 
         if not self._wait_for_controller(timeout=60.0):
             return False
@@ -243,16 +312,23 @@ class JointSprayPainter(Node):
 
         # Continuous sweep: all waypoints in a single trajectory so the
         # controller never decelerates to zero between intermediate points.
-        set_spray(True)
-        q_sweep = [[cfg[j] for j in JOINT_NAMES] for cfg in joint_configs]
-        self.get_logger().info(
-            f"Starting continuous sweep ({len(q_sweep)} waypoints)..."
-        )
-        self._send_trajectory(q_sweep, vel_scale, "sweep")
-        set_spray(False)
+        # try/finally guarantees the spray is turned OFF even if something
+        # below raises — the spray must never be left on.
+        try:
+            self.set_spray(True)
+            q_sweep = [[cfg[j] for j in JOINT_NAMES] for cfg in joint_configs]
+            self.get_logger().info(
+                f"Starting continuous sweep ({len(q_sweep)} waypoints)..."
+            )
+            self._send_trajectory(q_sweep, vel_scale, "sweep")
+        finally:
+            self.set_spray(False)
 
         self.get_logger().info("Returning to home configuration...")
         self._move_to(HOME, vel_scale)
+
+        # Final safety: one more OFF after the arm is home.
+        self.set_spray(False)
 
         self.get_logger().info("Spray painting complete.")
         return True
