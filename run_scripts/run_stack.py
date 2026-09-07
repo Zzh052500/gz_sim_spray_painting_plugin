@@ -42,9 +42,13 @@ import sys
 
 SESSION   = "spray_paint"
 TMUX_CONF = "/tmp/.tmux_spray.conf"
-ROS       = ". /opt/ros/humble/setup.bash && . /ws/install/setup.bash 2>/dev/null || true"
+# Isolate from host DDS pollution (Go2/rm_eco65 leftovers on domain 0).
+# Container uses --network host, so a unique ROS_DOMAIN_ID is REQUIRED,
+# otherwise move_group picks up foreign joint_states / collision objects.
+ROS       = "export ROS_DOMAIN_ID=10 && . /opt/ros/humble/setup.bash && . /ws/install/setup.bash 2>/dev/null || true"
 
-UR_WORLD   = "demo_car"
+UR_WORLD   = "demo_car"                  # primary UR world (listed first in the menu)
+UR_WORLDS  = {"demo_car", "demo_cabinet"}  # all worlds that launch the full UR5e stack
 RAIL_WORLD = "demo_car_rail"
 
 # ── Discover worlds dynamically ───────────────────────────────────────────────
@@ -58,7 +62,7 @@ if not os.path.isdir(WORLDS_DIR):
     sys.exit(1)
 
 def _mode_for(stem: str) -> str:
-    if stem == UR_WORLD:
+    if stem in UR_WORLDS:
         return "ur"
     if stem == RAIL_WORLD:
         return "rail"
@@ -122,7 +126,7 @@ def send(target, cmd, enter=True):
 if mode == "ur":
     # ── Window 0: sim (full UR5e stack) ──────────────────────────────────────
     tmux("new-session", "-d", "-s", SESSION, "-n", "sim", "-x", "220", "-y", "50")
-    send("sim.0", f"{ROS} && ros2 launch gz_spray_painting_plugin_demo ur_spray_demo.launch.py")
+    send("sim.0", f"{ROS} && ros2 launch gz_spray_painting_plugin_demo ur_spray_demo.launch.py headless:=true world:={world_stem}")
 
     # ── Window 1: cartesian_spray ─────────────────────────────────────────────
     tmux("new-window", "-t", SESSION, "-n", "cartesian_spray")

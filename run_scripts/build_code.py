@@ -67,7 +67,9 @@ def build():
     colcon_cmd = (
         ". /opt/ros/humble/setup.bash && "
         "cd /ws && "
+        "export MAKEFLAGS=-j2 && "
         "GZ_VERSION=harmonic colcon build --symlink-install "
+        "  --parallel-workers 1 "
         "  --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo "
         "  --event-handlers console_cohesion+"
     )

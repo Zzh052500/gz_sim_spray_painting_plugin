@@ -106,6 +106,13 @@ fi
 # SetEnvironmentVariable. Only GZ_VERSION is set here unconditionally.
 DOCKER_ARGS+=("-e" "GZ_VERSION=harmonic")
 DOCKER_ARGS+=("-e" "TERM=${TERM:-xterm-256color}")
+# ── DDS isolation ─────────────────────────────────────────────────────────────
+# Container uses --network host, so it shares the host's DDS domain (0).
+# Leftover participants from other stacks (e.g. Go2/rm_eco65) pollute domain 0
+# and break move_group (foreign joint_states / collision objects). A unique
+# ROS_DOMAIN_ID keeps this stack isolated. Set in the container env so every
+# ROS 2 node (launch, bridge, move_group, controllers) inherits it.
+DOCKER_ARGS+=("-e" "ROS_DOMAIN_ID=10")
 
 # ── Source code / install volume mounts ───────────────────────────────────────
 DOCKER_ARGS+=("-v" "$ROOT:/ws")
